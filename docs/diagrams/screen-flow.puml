@@ -1,0 +1,86 @@
+@startuml
+' Vtuber Wiki screen transition diagram
+skinparam handwritten true
+skinparam arrowColor #9B4370
+skinparam backgroundColor #F8F7F5
+skinparam state {
+  BackgroundColor #FFFFFF
+  BorderColor #C79A00
+  FontName "Zen Maru Gothic"
+}
+
+hide empty description
+
+state "ホーム\n/" as Home
+state "検索\n/search" as Search
+state "ページ閲覧\n/wiki/[slug]" as Wiki
+state "ページ編集\n/edit/[slug]" as Edit
+state "新規作成\n/new" as NewPage
+state "履歴・差分\n/history/[slug]" as History
+state "タグ詳細\n/tags/[tag]" as Tag
+state "アセット管理\n/assets" as Assets
+state "モデレーション\n/admin/moderation" as Moderation
+state "Discordログイン" as Auth
+
+state "プロフィール\n/profile" as Profile {
+  state "概要" as ProfileOverview
+  state "下書き一覧" as DraftList
+  state "通知設定" as NotificationSettings
+  [*] --> ProfileOverview
+  ProfileOverview --> DraftList : 下書きを表示
+  DraftList --> Edit : 再編集
+  ProfileOverview --> NotificationSettings : 通知設定を変更
+  DraftList --> ProfileOverview : 戻る
+  NotificationSettings --> ProfileOverview : 保存
+}
+
+[*] --> Home
+
+Home --> Auth : ログイン要求（新規作成・編集など）
+Auth --> Home : 認証成功
+
+Home --> Search : 検索バーからクエリ
+Home --> Wiki : 最近の更新/注目のページ
+Home --> Tag : タグクラウド選択
+Home --> NewPage : 「新規ページ」CTA（要ログイン）
+Home --> Profile : ヘッダーメニュー
+Home --> Assets : ナビゲーション（エディタ以上）
+Home --> Moderation : ナビゲーション（キュレーター以上）
+
+Search --> Wiki : 検索結果のページカード
+Search --> Home : ロゴから戻る
+
+Wiki --> Edit : 編集ボタン（要権限）
+Wiki --> History : 「差分を見る」リンク
+Wiki --> Tag : タグピルを選択
+Wiki --> Home : ロゴ/パンくず
+Wiki --> Wiki : RelatedTagCarousel で別ページ
+
+Edit --> Wiki : 保存後の閲覧
+Edit --> History : 履歴ショートカット
+Edit --> Assets : 画像タブから遷移
+Edit --> Home : ヘッダーロゴ
+Edit --> Auth : ログアウト
+
+NewPage --> Edit : 作成後にエディタ表示
+NewPage --> Home : キャンセル
+
+History --> Wiki : 比較終了後戻る
+History --> Moderation : ロールバック操作
+
+Tag --> Wiki : 一覧からページ
+Tag --> Home : ナビゲーション
+
+Assets --> Edit : 画像差し替え
+Assets --> Wiki : 使用ページへジャンプ
+Assets --> Home : ナビゲーション
+
+Profile --> Home : ロゴ
+Profile --> Wiki : 編集履歴/ウォッチページへ
+Profile --> Auth : ログアウト
+
+Moderation --> History : 通報差分の確認
+Moderation --> Wiki : 対象ページを開く
+Moderation --> Home : ナビゲーション
+
+@enduml
