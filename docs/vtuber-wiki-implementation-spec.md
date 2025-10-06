@@ -280,6 +280,17 @@ model WantedPage {
 - オートセーブは `debounce(5000)` で `/api/pages/[id]/revisions` へドラフト投稿。未保存警告を `beforeunload` で表示。
 - 権限に応じて即時公開か審査待ちを切り替え。`curator` 以上は「公開」ボタンで `publish` エンドポイント呼び出し。
 - 楽観ロック: 最新 `updatedAt` が一致しない場合、競合ダイアログで差分を提示し再取得。
+- Heading ノードには `attrs.id`（slugifiedテキスト）、`attrs.level`、`attrs.htmlAttributes['data-category']` を保持。エディタの見出しツールバーにカテゴリセレクト（初期カテゴリ + ユーザー追加分）を設置し、選択内容を `data-category` に即時反映する。翻訳モード（将来の i18n 対応時）はカテゴリは原文のキーを維持し、翻訳対象外として扱う。
+
+### 6.1 見出しカテゴリ解析（サーバーサイド）
+
+1. リビジョン保存時、TipTap JSON (`PageRevision.content`) をサーバーで受領したら、`doc.content` を走査して `type === 'heading'` のノードを抽出。
+2. 各見出しで以下の順序でカテゴリを決定する。
+   - `node.attrs?.htmlAttributes?.['data-category']` が存在すればそれを採用。
+   - 存在しない場合は `node.attrs?.textAlign` 等の他属性は無視し、`node.content` のテキストを連結した上でクライアントと同一のキーワードマッピングテーブルで再判定（整合性チェック）。
+   - `node.attrs?.tags`（クライアント側が付与する補助タグ配列）が存在すれば、そこに含まれるカテゴリキーのうち最初のものを採用。
+3. 上記のいずれでもカテゴリが確定しない場合は 400 エラーを返し、クライアントに「カテゴリを選択してください」と表示させる（サーバー側でデフォルト付与はしない）。暫定カテゴリとして「その他」を選べるようクライアント UI で案内する。
+4. 正常な見出し配列を得たら、`[{ id, text, level, category }]` の形で TOC 生成に利用し、ページ保存時には `PageRevision.content` にも `data-category` を保持する。
 
 ## 7. 差分・履歴
 
