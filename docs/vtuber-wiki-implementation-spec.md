@@ -57,7 +57,7 @@ model User {
   discordId   String   @unique
   name        String
   avatarUrl   String?
-  role        Role     @default(EDITOR_PENDING)
+  role        Role     @default(VIEWER)
   createdPages Page[]  @relation("PageCreator")
   updatedPages Page[]  @relation("PageUpdater")
   revisions   PageRevision[]
@@ -70,8 +70,7 @@ model User {
 
 enum Role {
   VIEWER
-  EDITOR_PENDING
-  CURATOR
+  EDITOR
   ADMIN
 }
 
@@ -79,7 +78,10 @@ model Page {
   id            String         @id @default(cuid())
   slug          String         @unique
   title         String
+  reading       String?        @db.VarChar(255)
   type          PageType
+  titleImageAssetId String?
+  titleImage     Asset?        @relation("PageTitleImage", fields: [titleImageAssetId], references: [id])
   contentType   ContentType    @default(TIPTAP_JSON)
   createdBy     String
   creator       User           @relation("PageCreator", fields: [createdBy], references: [id])
@@ -92,6 +94,8 @@ model Page {
   tags          PageTag[]
   revisions     PageRevision[]
   wantedBy      WantedPage?
+
+  @@index([reading])
 }
 
 enum PageType {
@@ -120,7 +124,6 @@ model PageRevision {
 
 enum RevisionStatus {
   DRAFT
-  PENDING_REVIEW
   PUBLISHED
   ROLLED_BACK
 }
@@ -152,6 +155,7 @@ model Asset {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
   usages      AssetUsage[]
+  titleForPages Page[] @relation("PageTitleImage")
 }
 
 model AssetUsage {
@@ -202,6 +206,9 @@ model WantedPage {
 }
 ```
 
+- `Page.reading` にはページタイトルの読み仮名（かな文字）を格納。登録時にかな文字へ正規化し、未入力の場合はタイトルから自動生成する。
+- `Page.titleImageAssetId` は正方形のタイトルサムネイル。アップロード時にブラウザで 512×512 以下へリサイズし、Prisma では外部キー制約で `Asset.id` に紐付ける。
+
 ### 2.2 補助テーブル
 
 - `watch_list(pageId, userId, createdAt)`：ウォッチ通知設定
@@ -212,11 +219,11 @@ model WantedPage {
 
 | Method | Path | 概要 | 主な処理 | 認可 |
 |--------|------|------|----------|------|
-| GET | /api/pages | ページ一覧・検索 | クエリ（`query`,`type`,`tag`,`sort`,`cursor`,`limit`）でページネーション検索 | Public |
+| GET | /api/pages | ページ一覧・検索 | クエリ（`query`,`type`,`tag`,`sort`,`cursor`,`limit`）でページネーション検索（`sort` は `aiueo` / `created_desc`） | Public |
 | GET | /api/pages/[slug] | ページ詳細 | 公開版＋最新下書きを取得。閲覧数計測は別途 Edge Function | Public |
 | POST | /api/pages | 新規作成 | slug 生成、下書きページ作成、監査ログ記録 | Editor+ |
-| POST | /api/pages/[id]/revisions | リビジョン保存 | TipTap JSON と `summary` を保存。`role` に応じて `status` 切替 | Editor+ |
-| POST | /api/pages/[id]/publish | 公開/ロールバック | 対象リビジョンを公開。`audit_log` へ記録 | Curator+ |
+| POST | /api/pages/[id]/revisions | リビジョン保存 | TipTap JSON と `summary` を保存。常に `status=DRAFT` で記録 | Editor+ |
+| POST | /api/pages/[id]/publish | 公開/ロールバック | 対象リビジョンを公開。既存公開版を `ROLLED_BACK` に更新し `audit_log` へ記録 | Editor+ |
 | GET | /api/revisions | リビジョン履歴 | `slug` でフィルタし、差分表示用に前リビジョンIDも付与 | Editor+ |
 | POST | /api/upload | 画像署名URL | Vercel Blob 署名発行。成功後 `Asset` 作成 | Editor+ |
 | POST | /api/report | 通報 | ページ/リビジョン/アセットの問題を登録。Rate limit + hCaptcha | Authenticated |
@@ -228,12 +235,20 @@ model WantedPage {
 - `middleware.ts` にて `next-safe-middleware`、`csrf`、`rate limit` を適用。
 - 監査対象操作（公開/ロールバック/凍結など）は `AuditLog` に記録。
 
+#### リビジョン状態更新
+
+| 操作 | 実行エンドポイント | 状態変更 | 備考 |
+|------|--------------------|----------|------|
+| 下書き保存 | `POST /api/pages/[id]/revisions` | 新規リビジョンを `DRAFT` で作成 | `editorId` はログインユーザー。複数ドラフトが並存可能 |
+| 公開 | `POST /api/pages/[id]/publish` | 対象リビジョンを `PUBLISHED` に更新。既存公開版は `ROLLED_BACK` | `pages.isPublished=true`、`pages.updatedBy` 更新 |
+| ロールバック | `POST /api/pages/[id]/publish`（過去リビジョン指定） | 指定リビジョンを `PUBLISHED`、それ以外を `ROLLED_BACK` | 差し替え後に ISR キャッシュを失効 |
+
 ## 4. 認証 / 権限
 
-- NextAuth.js（Discord OAuth）を `/api/auth/[...nextauth]/route.ts` で構成。
-- ロールは DB 上の `User.role` で管理。初回ログインで `EDITOR_PENDING` に設定。
-- サーバー側では `getCurrentUser()` ヘルパーを `src/server/auth.ts` に用意。
-- 権限判定は `assertRole(user, Role.CURATOR)` などのユーティリティで統一。
+- NextAuth.js（Discord OAuth）を `/api/auth/[...nextauth]/route.ts` で構成。コールバック時に Discord Bot Token を用いて対象ギルド（環境変数 `DISCORD_REQUIRED_GUILD_ID`）への参加状況を API で照会する。
+- ギルド参加済みの場合は `User.role` を `EDITOR` に更新し、未参加の場合は `VIEWER` のままとする。初回ログイン時のデフォルトは `VIEWER`。
+- サーバー側では `getCurrentUser()` ヘルパーを `src/server/auth.ts` に用意し、`session.user.role` を Prisma から再読込する。
+- 権限判定ユーティリティとして `assertEditor(user)`（`role` が `EDITOR` または `ADMIN`）と `assertAdmin(user)` を提供し、API/Server Action で共通利用する。
 
 ## 5. フロントエンド構成
 
@@ -250,7 +265,7 @@ model WantedPage {
 |-------|--------------|--------------------|
 | `/` | `src/app/page.tsx` | `<HeroSection>`, `<SearchBar>`, `<RecentUpdatesGrid>`, `<FeaturedPages>`, `<TagCloud>` |
 | `/search` | `src/app/search/page.tsx` | `<SearchFilters>`, `<SearchResultList>`, `<InfiniteScrollTrigger>`, `<EmptyState>` |
-| `/wiki/[slug]` | `src/app/wiki/[slug]/page.tsx` | `<PageHeader>`, `<InfoBar>`, `<TipTapRenderer>`, `<TableOfContents>`（カテゴリ折りたたみ）, `<InfoboxCard>`, `<RelatedTagCarousel>` |
+| `/wiki/[slug]` | `src/app/wiki/[slug]/page.tsx` | `<PageHeader>`, `<TitleThumbnail>`, `<InfoBar>`, `<TipTapRenderer>`, `<RichTableOfContents>`（カテゴリ別カード + アイコン）, `<InfoboxCard>`, `<RelatedTagCarousel>` |
 | `/edit/[slug]` | `src/app/edit/[slug]/page.tsx` | `<EditorShell>`, `<TipTapEditor>`, `<SidebarTabs>`（Infobox / Blocks / Assets / Preview）, `<SaveBar>`, `<DiffSummaryDialog>` |
 | `/new` | `src/app/new/page.tsx` | `<PageCreationForm>`, `<TypeSelector>`, `<SlugPreview>` |
 | `/history/[slug]` | `src/app/history/[slug]/page.tsx` | `<RevisionList>`, `<RevisionDiffViewer>`, `<RollbackActionBar>` |
@@ -259,13 +274,15 @@ model WantedPage {
 | `/profile` | `src/app/profile/page.tsx` | `<ProfileHeader>`, `<DraftList>`, `<WatchList>`, `<NotificationSettings>` |
 | `/admin/moderation` | `src/app/admin/moderation/page.tsx` | `<ReportQueue>`, `<DiffPreviewPanel>`, `<ModerationActions>`, `<RateLimitStats>` |
 
+- 検索フィルターの `sort` は `aiueo`（読み仮名昇順）と `created_desc`（作成日時降順）の2種類。`aiueo` 選択時は API から返却される `reading` をそのままソートキーに用いる。
+- `RichTableOfContents` はガラスモーフィズムのカードをカテゴリ毎に並べ、各見出しアイテムへアイコン＋読み仮名チップを付与。スクロール追従とフェード/スライドアニメーション（150ms）を実装する。
 ### 5.3 共通ディレクトリ
 
 - `src/components/ui/`：shadcn/ui ベースのボタン、モーダル、トースト、フォームコンポーネント。
 - `src/components/layout/`：`<AppShell>`, `<MainHeader>`, `<SiteFooter>`, `<ThemeSwitcher>`。
-- `src/components/wiki/`：Infobox, Timeline, Gallery, YouTubeEmbed, ReferenceList 等 TipTap ノードレンダラー。
-- `src/components/editor/`：TipTap 用のメニューバー、BubbleMenu、SlashCommand、ImageUploader。
-- `src/components/table-of-contents/`：カテゴリ別折りたたみ TOC コンポーネント。
+- `src/components/wiki/`：Infobox, Timeline, Gallery, YouTubeEmbed, TweetEmbed, ReferenceList, TitleThumbnail 等 TipTap ノードレンダラー。
+- `src/components/editor/`：TipTap 用のメニューバー、BubbleMenu、SlashCommand、ImageUploader、TitleThumbnailForm。
+- `src/components/table-of-contents/`：リッチカードレイアウトの TOC（カテゴリ毎カード + アイコン + スクロール追従）。
 - `src/features/`：`search/`, `pages/`, `history/`, `moderation/` 等、機能単位の hooks + コンポーネント。
 
 ### 5.4 状態管理
@@ -275,17 +292,77 @@ model WantedPage {
 
 ## 6. エディタ仕様
 
-- TipTap エディタ拡張：Heading, Bold, Italic, Link, List, Table, Blockquote, Footnote, CodeBlock, HorizontalRule, Image, Gallery, Timeline, Reference。
+- TipTap エディタ拡張：Heading, Bold, Italic, Link, List, Table, Blockquote, Footnote, CodeBlock, HorizontalRule, Image, Gallery, Timeline, Reference, Tweet。
 - 画像アップロードは D&D/ペースト対応、Vercel Blob の一時 URL を取得しプレビュー→保存時に確定。
+- タイトルサムネイルフォームで 512×512 以下の画像をアップロード/選択し、`titleImageAssetId` を更新する。比率が異なる場合はクライアント側でクロップ。
 - オートセーブは `debounce(5000)` で `/api/pages/[id]/revisions` へドラフト投稿。未保存警告を `beforeunload` で表示。
-- 権限に応じて即時公開か審査待ちを切り替え。`curator` 以上は「公開」ボタンで `publish` エンドポイント呼び出し。
+- `editor` 以上にのみ「公開」ボタンを表示し `/api/pages/[id]/publish` を実行できる。`viewer` は閲覧専用。
 - 楽観ロック: 最新 `updatedAt` が一致しない場合、競合ダイアログで差分を提示し再取得。
+
+### 6.1 カスタムノード型定義とレンダラー
+
+```ts
+// src/types/tiptap.ts
+export interface InfoboxNodeAttrs {
+  title: string;
+  thumbnail?: { url: string; alt?: string };
+  fields?: Array<{ label: string; value: string }>;
+  links?: Array<{ label: string; url: string }>;
+  colorTheme?: string;
+}
+
+export interface TimelineNodeAttrs {
+  events: Array<{
+    date?: string;
+    dateRange?: { start: string; end: string };
+    title: string;
+    description?: string;
+    media?: { url: string; type: "image" | "video" };
+  }>;
+}
+
+export interface GalleryNodeAttrs {
+  layout?: "grid" | "carousel";
+  images: Array<{ assetId?: string; url?: string; alt?: string }>;
+  caption?: string;
+}
+
+export interface YouTubeNodeAttrs {
+  videoId: string;
+  start?: number;
+  end?: number | null;
+  title?: string;
+}
+
+export interface ReferenceNodeAttrs {
+  entries: Array<{ label: string; url: string; note?: string }>;
+}
+
+export interface TweetNodeAttrs {
+  tweetId: string;
+  author?: string;
+  fallbackText?: string;
+  lang?: string;
+}
+
+export type CustomNodeAttrs =
+  | InfoboxNodeAttrs
+  | TimelineNodeAttrs
+  | GalleryNodeAttrs
+  | YouTubeNodeAttrs
+  | ReferenceNodeAttrs
+  | TweetNodeAttrs;
+```
+
+- TipTap 拡張は `createNode({ name: "infobox", group: "block", atom: true, addAttributes: () => ({ ... }) })` のように上記 attr 型を利用。
+- レンダラーは `src/components/wiki/nodes/` 配下で `InfoboxNode`, `TimelineNode`, `TweetNode` などを用意し、`TipTapRenderer` から `switch (node.type)` でマッピング。Tweet ノードは `next/script` で Twitter ウィジェットを遅延読込し、`fallbackText` をカードで表示するフェールセーフを実装。
+- サーバー側では `src/server/validation/tiptap.ts` に zod スキーマを用意し、`InfoboxNodeSchema` などで属性を検証し余計なキーを削除する。
 
 ## 7. 差分・履歴
 
 - `/history/[slug]` に `RevisionList`（リビジョンID / 編集者 / 要約 / 日時 / ステータス / サイズ）。
 - 比較 UI は左右比較とインライン比較の 2 モード。`jsondiffpatch` を TipTap ノード毎に適用し差分をハイライト。
-- `curator` 以上は `RollbackActionBar` から対象リビジョンを指定して `/api/pages/[id]/publish` を呼び出す。
+- `editor` 以上は `RollbackActionBar` から対象リビジョンを指定して `/api/pages/[id]/publish` を呼び出す。
 
 ## 8. 通知 / モデレーション
 
@@ -318,7 +395,7 @@ model WantedPage {
 
 1. 認証・DB 基盤構築（NextAuth, Prisma）
 2. ページ閲覧 & 検索 MVP（TipTap Renderer, TOC, タグ）
-3. エディタ & リビジョンフロー実装（下書き、承認、公開）
+3. エディタ & リビジョンフロー実装（下書き、公開）
 4. テーマ適用・キャラクターページ特別レイアウト・Hero セクション演出
 5. 差分ビュー / 履歴 UI 強化 + モデレーション操作
 6. アセット管理・通報キュー・通知設定
